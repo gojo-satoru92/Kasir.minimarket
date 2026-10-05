@@ -4,6 +4,10 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>UKHUWAH MART - Minimarket POS</title>
+  <script defer src="./vendor/xlsx.full.min.js"></script>
+  <script defer src="./vendor/html5-qrcode.min.js"></script>
+  <script defer src="./vendor/print.js"></script>
+  <link rel="stylesheet" href="./vendor/print.css">
   
   <style>
     :root {
@@ -396,10 +400,11 @@
   <div id="loginModal" class="modal-overlay" style="display:flex;">
     <div class="modal-content" style="max-width:380px;">
       <h2 style="margin-top:0;">🔐 Login Sistem POS</h2>
+      <p class="small-muted">Data hanya tersimpan di browser ini, tidak tersinkron ke perangkat lain. Ekspor data secara berkala sebagai cadangan.</p>
 
       <div id="loginStatus" class="status-box"></div>
 
-      <form onsubmit="prosesLogin(event)">
+      <form id="loginForm" onsubmit="prosesLogin(event)">
         <div class="form-group" style="text-align:left;">
           <label>Email Pengguna:</label>
           <input
@@ -430,6 +435,25 @@
           Masuk Aplikasi
         </button>
       </form>
+
+      <details id="setupAdminPanel" style="margin-top:18px;text-align:left;">
+        <summary style="cursor:pointer;font-weight:bold;">Buat Admin pertama</summary>
+        <form onsubmit="buatAdminPertama(event)" style="margin-top:12px;">
+          <div class="form-group">
+            <label>Nama Admin:</label>
+            <input type="text" id="setupAdminNama" class="form-control" required>
+          </div>
+          <div class="form-group">
+            <label>Email Admin:</label>
+            <input type="email" id="setupAdminEmail" class="form-control" required>
+          </div>
+          <div class="form-group">
+            <label>Password (minimal 8 karakter):</label>
+            <input type="password" id="setupAdminPassword" class="form-control" minlength="8" required autocomplete="new-password">
+          </div>
+          <button type="submit" class="btn btn-success" style="width:100%;">Buat Admin</button>
+        </form>
+      </details>
     </div>
   </div>
 
@@ -886,7 +910,7 @@
               type="password"
               id="addPasswordKaryawan"
               class="form-control"
-              minlength="6"
+              minlength="8"
               placeholder="••••••••"
               required
               autocomplete="new-password">
@@ -1008,6 +1032,332 @@
     let riwayatStok = [];
     let transaksiSedangDiproses = false;
 
+    const DATABASE_NAME = "ukhuwa-mart";
+    const DATABASE_VERSION = 1;
+    const RECORDS_STORE = "records";
+    const LEGACY_DATA_KEY = "ukhuwa-mart-data-v1";
+    const SESSION_KEY = "ukhuwa-mart-session-v1";
+    const localSubscribers = new Map();
+    let localTransactionQueue = Promise.resolve();
+    let databasePromise = null;
+    const dataBroadcast = "BroadcastChannel" in window
+      ? new BroadcastChannel("ukhuwa-mart-data")
+      : null;
+
+    function cloneData(value) {
+      return value === undefined ? undefined : JSON.parse(JSON.stringify(value));
+    }
+
+    function openLocalDatabase() {
+      if (databasePromise) return databasePromise;
+      databasePromise = new Promise((resolve, reject) => {
+        const request = indexedDB.open(DATABASE_NAME, DATABASE_VERSION);
+        request.onupgradeneeded = () => {
+          if (!request.result.objectStoreNames.contains(RECORDS_STORE)) {
+            request.result.createObjectStore(RECORDS_STORE, { keyPath: ["collection", "id"] });
+          }
+        };
+        request.onsuccess = () => {
+          request.result.onversionchange = () => {
+            request.result.close();
+            databasePromise = null;
+          };
+          resolve(request.result);
+        };
+        request.onerror = () => {
+          databasePromise = null;
+          reject(request.error || new Error("Gagal membuka database IndexedDB."));
+        };
+        request.onblocked = () => {
+          databasePromise = null;
+          reject(new Error("Database diblokir tab lain. Tutup tab aplikasi lainnya lalu muat ulang."));
+        };
+      });
+      return databasePromise;
+    }
+
+    function requestResult(request) {
+      return new Promise((resolve, reject) => {
+        request.onsuccess = () => resolve(request.result);
+        request.onerror = () => reject(request.error || new Error("Operasi IndexedDB gagal."));
+      });
+    }
+
+    async function withRecordStore(mode, callback) {
+      const database = await openLocalDatabase();
+      return new Promise((resolve, reject) => {
+        let transaction;
+        try {
+          transaction = database.transaction(RECORDS_STORE, mode);
+        } catch (error) {
+          reject(error);
+          return;
+        }
+        let result;
+        let actionFinished = false;
+        let transactionFinished = false;
+        const finish = () => {
+          if (transactionFinished && actionFinished) resolve(result);
+        };
+        transaction.oncomplete = () => {
+          transactionFinished = true;
+          finish();
+        };
+        transaction.onabort = () => {
+          transactionFinished = true;
+          reject(transaction.error || new Error("Transaksi IndexedDB dibatalkan."));
+        };
+        transaction.onerror = () => reject(transaction.error || new Error("Transaksi IndexedDB gagal."));
+        const keepTransactionActive = () => {
+          if (actionFinished || transactionFinished) return;
+          const request = transaction.objectStore(RECORDS_STORE).get(["__system", "keepalive"]);
+          request.onsuccess = keepTransactionActive;
+        };
+        keepTransactionActive();
+        Promise.resolve()
+          .then(() => callback(transaction.objectStore(RECORDS_STORE), transaction))
+          .then(value => {
+            result = value;
+            actionFinished = true;
+            finish();
+          })
+          .catch(error => {
+            try {
+              transaction.abort();
+            } catch (abortError) {
+              console.error("Gagal membatalkan transaksi IndexedDB:", abortError);
+            }
+            reject(error);
+          });
+      });
+    }
+
+    async function migrateLegacyLocalStorage() {
+      let legacyData;
+      const raw = localStorage.getItem(LEGACY_DATA_KEY);
+      if (raw) {
+        legacyData = JSON.parse(raw);
+        if (!legacyData || typeof legacyData !== "object" || Array.isArray(legacyData)) {
+          throw new Error("Data lama tidak dapat dimigrasikan karena formatnya tidak dikenal.");
+        }
+      }
+      await withRecordStore("readwrite", async store => {
+        const marker = await requestResult(store.get(["__system", "legacy-migration-v1"]));
+        if (marker) return;
+        if (legacyData) {
+          for (const [collection, entries] of Object.entries(legacyData)) {
+            if (!entries || typeof entries !== "object" || Array.isArray(entries)) continue;
+            for (const [id, value] of Object.entries(entries)) {
+              store.put({ collection, id, value });
+            }
+          }
+        }
+        store.put({ collection: "__system", id: "legacy-migration-v1", value: true });
+      });
+      if (raw) localStorage.removeItem(LEGACY_DATA_KEY);
+    }
+
+    function createLocalId() {
+      if (crypto.randomUUID) return crypto.randomUUID();
+      return `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    }
+
+    class LocalDocumentSnapshot {
+      constructor(id, value) {
+        this.id = id;
+        this.exists = value !== undefined;
+        this.value = value;
+      }
+      data() {
+        return cloneData(this.value);
+      }
+    }
+
+    class LocalDocumentReference {
+      constructor(collection, id) {
+        this.collectionName = collection;
+        this.id = id || createLocalId();
+      }
+      async get() {
+        const record = await withRecordStore("readonly", store =>
+          requestResult(store.get([this.collectionName, this.id]))
+        );
+        return new LocalDocumentSnapshot(this.id, record?.value);
+      }
+      async set(value, options = {}) {
+        await withRecordStore("readwrite", async store => {
+          const key = [this.collectionName, this.id];
+          const existing = options.merge ? await requestResult(store.get(key)) : null;
+          store.put({
+            collection: this.collectionName,
+            id: this.id,
+            value: options.merge
+              ? { ...(existing?.value || {}), ...cloneData(value) }
+              : cloneData(value)
+          });
+        });
+        notifyChangedCollections([this.collectionName]);
+      }
+      async update(value) {
+        await applyLocalWrites([{ type: "update", ref: this, value }]);
+      }
+      async delete() {
+        await applyLocalWrites([{ type: "delete", ref: this }]);
+      }
+    }
+
+    class LocalQuery {
+      constructor(collection, order = null, maxItems = null) {
+        this.collectionName = collection;
+        this.order = order;
+        this.maxItems = maxItems;
+      }
+      orderBy(field, direction = "asc") {
+        return new LocalQuery(this.collectionName, { field, direction }, this.maxItems);
+      }
+      limit(maxItems) {
+        return new LocalQuery(this.collectionName, this.order, maxItems);
+      }
+      async get() {
+        const records = await withRecordStore("readonly", store => requestResult(store.getAll()));
+        let docs = records
+          .filter(record => record.collection === this.collectionName)
+          .map(record => new LocalDocumentSnapshot(record.id, record.value));
+        if (this.order) {
+          const { field, direction } = this.order;
+          docs.sort((a, b) => {
+            const left = a.data()?.[field] ?? "";
+            const right = b.data()?.[field] ?? "";
+            const comparison = String(left).localeCompare(String(right));
+            return direction === "desc" ? -comparison : comparison;
+          });
+        }
+        if (this.maxItems !== null) docs = docs.slice(0, this.maxItems);
+        return { docs };
+      }
+      onSnapshot(onNext, onError = console.error) {
+        const subscriber = async () => {
+          try {
+            onNext(await this.get());
+          } catch (error) {
+            onError(error);
+          }
+        };
+        const listeners = localSubscribers.get(this.collectionName) || new Set();
+        listeners.add(subscriber);
+        localSubscribers.set(this.collectionName, listeners);
+        subscriber();
+        return () => listeners.delete(subscriber);
+      }
+    }
+
+    class LocalCollection extends LocalQuery {
+      doc(id) {
+        return new LocalDocumentReference(this.collectionName, id);
+      }
+      async add(value) {
+        const ref = this.doc();
+        await ref.set(value);
+        return ref;
+      }
+    }
+
+    function notifyLocalSubscribers(collectionName) {
+      for (const subscriber of localSubscribers.get(collectionName) || []) subscriber();
+    }
+
+    function notifyChangedCollections(collections) {
+      const changed = [...new Set(collections)];
+      changed.forEach(notifyLocalSubscribers);
+      dataBroadcast?.postMessage(changed);
+    }
+
+    if (dataBroadcast) {
+      dataBroadcast.onmessage = event => {
+        if (Array.isArray(event.data)) event.data.forEach(notifyLocalSubscribers);
+      };
+    }
+
+    async function applyLocalWrites(writes) {
+      if (!writes.length) return;
+      await withRecordStore("readwrite", async store => {
+        await applyLocalWritesToStore(store, writes);
+      });
+      notifyChangedCollections(writes.map(write => write.ref.collectionName));
+    }
+
+    async function applyLocalWritesToStore(store, writes) {
+      for (const write of writes) {
+        const { collectionName, id } = write.ref;
+        if (write.type === "update") {
+          const existing = await requestResult(store.get([collectionName, id]));
+          if (!existing) throw new Error("Data yang akan diubah tidak ditemukan.");
+          store.put({
+            collection: collectionName,
+            id,
+            value: { ...existing.value, ...cloneData(write.value) }
+          });
+        } else if (write.type === "set") {
+          const key = [collectionName, id];
+          const existing = write.options?.merge ? await requestResult(store.get(key)) : null;
+          store.put({
+            collection: collectionName,
+            id,
+            value: write.options?.merge
+              ? { ...(existing?.value || {}), ...cloneData(write.value) }
+              : cloneData(write.value)
+          });
+        } else {
+          store.delete([collectionName, id]);
+        }
+      }
+    }
+
+    const localDb = {
+      collection(name) {
+        return new LocalCollection(name);
+      },
+      batch() {
+        const writes = [];
+        return {
+          set(ref, value, options = {}) { writes.push({ type: "set", ref, value, options }); },
+          update(ref, value) { writes.push({ type: "update", ref, value }); },
+          delete(ref) { writes.push({ type: "delete", ref }); },
+          async commit() { await applyLocalWrites(writes); }
+        };
+      },
+      async runTransaction(callback) {
+        const execute = async () => {
+          const outcome = await withRecordStore("readwrite", async store => {
+            const writes = [];
+            const transaction = {
+              async get(ref) {
+                const record = await requestResult(store.get([ref.collectionName, ref.id]));
+                return new LocalDocumentSnapshot(ref.id, record?.value);
+              },
+              set(ref, value, options = {}) { writes.push({ type: "set", ref, value, options }); },
+              update(ref, value) { writes.push({ type: "update", ref, value }); },
+              delete(ref) { writes.push({ type: "delete", ref }); }
+            };
+            const result = await callback(transaction);
+            await applyLocalWritesToStore(store, writes);
+            return { result, changed: writes.map(write => write.ref.collectionName) };
+          });
+          notifyChangedCollections(outcome.changed);
+          return outcome.result;
+        };
+        const run = () => {
+          if (navigator.locks?.request) {
+            return navigator.locks.request("ukhuwa-mart-data", execute);
+          }
+          return execute();
+        };
+        const operation = localTransactionQueue.then(run, run);
+        localTransactionQueue = operation;
+        return operation;
+      }
+    };
+
 
     /* =====================================================
        HELPER
@@ -1031,6 +1381,12 @@
       return String(value ?? "").trim().toLowerCase();
     }
 
+    function pastikanXlsxTersedia() {
+      if (typeof XLSX !== "undefined") return true;
+      alert("Pustaka spreadsheet belum termuat. Periksa koneksi internet lalu muat ulang halaman.");
+      return false;
+    }
+
     function tampilStatusLogin(message, type) {
       const box = document.getElementById("loginStatus");
 
@@ -1052,153 +1408,134 @@
 
 
     /* =====================================================
-       AUTH / LOGIN ROBUST
+       LOCAL ACCOUNTS AND DATA
     ===================================================== */
 
-    let authFlowUid = null;
-    let profileRequestUid = null;
-
-    function setUserFromAuth(user, roleFallback = "kasir") {
-      if (!user) {
-        currentUser = null;
-        return;
+    async function hashPassword(password, salt) {
+      if (!crypto.subtle) {
+        throw new Error("Browser tidak mendukung penyimpanan password yang aman. Buka aplikasi melalui localhost atau HTTPS.");
       }
+      const key = await crypto.subtle.importKey(
+        "raw",
+        new TextEncoder().encode(password),
+        "PBKDF2",
+        false,
+        ["deriveBits"]
+      );
+      const bits = await crypto.subtle.deriveBits(
+        { name: "PBKDF2", salt: new TextEncoder().encode(salt), iterations: 120000, hash: "SHA-256" },
+        key,
+        256
+      );
+      return Array.from(new Uint8Array(bits), byte => byte.toString(16).padStart(2, "0")).join("");
+    }
 
-      currentUser = {
-        uid: user.uid,
-        email: user.email || "",
-        nama: user.email ? user.email.split("@")[0] : "Pengguna",
-        role: roleFallback
+    async function buatAkun(data, password) {
+      const salt = createLocalId();
+      return {
+        ...data,
+        aktif: true,
+        passwordSalt: salt,
+        passwordHash: await hashPassword(password, salt)
       };
     }
 
-    async function muatProfilPengguna(user) {
-  if (!user) return;
-
-  if (profileRequestUid === user.uid) return;
-  profileRequestUid = user.uid;
-
-  try {
-    const doc = await Promise.race([
-      db.collection("pengguna").doc(user.uid).get(),
-
-      new Promise((_, reject) =>
-        setTimeout(
-          () => reject(
-            new Error("Timeout membaca profil pengguna")
-          ),
-          10000
-        )
-      )
-    ]);
-
-    // Profil tidak ditemukan
-    if (!doc.exists) {
-      throw new Error(
-        "Profil pengguna tidak ditemukan."
-      );
+    async function buatAdminPertama(event) {
+      event.preventDefault();
+      try {
+        const existingAccounts = (await localDb.collection("pengguna").get()).docs;
+        if (existingAccounts.some(doc => doc.data().role === "admin")) {
+          throw new Error("Admin sudah dibuat. Silakan masuk.");
+        }
+        const nama = document.getElementById("setupAdminNama").value.trim();
+        const email = normalisasi(document.getElementById("setupAdminEmail").value);
+        const password = document.getElementById("setupAdminPassword").value;
+        if (password.length < 8) throw new Error("Password minimal 8 karakter.");
+        const account = await buatAkun({ nama, email, role: "admin" }, password);
+        await localDb.collection("pengguna").add(account);
+        document.getElementById("setupAdminPanel").hidden = true;
+        document.getElementById("loginForm").hidden = false;
+        event.target.reset();
+        tampilStatusLogin("Admin berhasil dibuat. Silakan masuk.", "success");
+      } catch (error) {
+        console.error("Gagal membuat Admin:", error);
+        tampilStatusLogin("Gagal membuat Admin: " + error.message, "error");
+      }
     }
 
-    const data = doc.data() || {};
-
-    const role =
-      String(data.role || "").toLowerCase();
-
-    const aktif =
-      data.aktif === true;
-
-    // Role harus valid
-    if (role !== "admin" && role !== "kasir") {
-      throw new Error(
-        "Role pengguna tidak valid."
-      );
+    async function prosesLogin(event) {
+      event.preventDefault();
+      try {
+        const email = normalisasi(document.getElementById("loginEmail").value);
+        const password = document.getElementById("loginPassword").value;
+        const snapshot = await localDb.collection("pengguna").get();
+        const user = snapshot.docs.map(doc => ({ uid: doc.id, ...doc.data() }))
+          .find(account => normalisasi(account.email) === email);
+        if (!user || !user.aktif || !user.passwordSalt || !user.passwordHash) {
+          throw new Error("Email atau password salah, atau akun tidak aktif.");
+        }
+        const passwordHash = await hashPassword(password, user.passwordSalt);
+        if (passwordHash !== user.passwordHash) throw new Error("Email atau password salah.");
+        sessionStorage.setItem(SESSION_KEY, user.uid);
+        currentUser = { uid: user.uid, email: user.email, nama: user.nama, role: user.role, aktif: true };
+        tampilStatusLogin("", "");
+        cekSesiLogin();
+        inisialisasiDataListeners();
+        document.getElementById("loginPassword").value = "";
+      } catch (error) {
+        console.error("Login gagal:", error);
+        tampilStatusLogin(error.message, "error");
+      }
     }
 
-    // Akun harus aktif
-    if (!aktif) {
-      throw new Error(
-        "Akun pengguna sedang tidak aktif."
-      );
+    function prosesLogout() {
+      try {
+        sessionStorage.removeItem(SESSION_KEY);
+        hentikanDataListeners();
+        currentUser = null;
+        keranjang = [];
+        cekSesiLogin();
+        tampilStatusLogin("", "");
+      } catch (error) {
+        console.error("Logout gagal:", error);
+        alert("Gagal keluar: " + error.message);
+      }
     }
 
-    // Profil valid
-    currentUser = {
-      uid: user.uid,
-
-      email:
-        user.email ||
-        data.email ||
-        "",
-
-      nama:
-        data.nama ||
-        (
-          user.email
-            ? user.email.split("@")[0]
-            : "Pengguna"
-        ),
-
-      role: role,
-
-      aktif: true
-    };
-
-    console.log(
-      "Profil pengguna berhasil diverifikasi:",
-      currentUser
-    );
-
-    // Hanya mulai aplikasi setelah profil
-    // berhasil diverifikasi.
-    cekSesiLogin();
-
-    inisialisasiFirestoreListeners();
-
-  } catch (err) {
-
-    console.warn(
-      "Akses pengguna ditolak:",
-      err.message
-    );
-
-    // Jangan memberikan akses sebagai Kasir
-    // jika profil bermasalah.
-    currentUser = null;
-
-    // Hentikan listener Firestore
-    hentikanFirestoreListeners();
-
-    // Reset status sesi
-    authFlowUid = null;
-    profileRequestUid = null;
-
-    tampilStatusLogin(
-      "❌ " + err.message,
-      "error"
-    );
-
-    // Keluar dari Firebase Authentication
-    try {
-      await auth.signOut();
-    } catch (logoutError) {
-      console.warn(
-        "Gagal logout Firebase:",
-        logoutError.message
-      );
+    async function muatSesiLokal() {
+      try {
+        await migrateLegacyLocalStorage();
+        const sessionId = sessionStorage.getItem(SESSION_KEY);
+        const setupPanel = document.getElementById("setupAdminPanel");
+        const loginForm = document.getElementById("loginForm");
+        const accountSnapshot = await localDb.collection("pengguna").get();
+        const accounts = Object.fromEntries(accountSnapshot.docs.map(doc => [doc.id, doc.data()]));
+        const hasAdmin = Object.values(accounts).some(user => user.role === "admin");
+        setupPanel.hidden = hasAdmin;
+        loginForm.hidden = !hasAdmin;
+        if (sessionId && accounts[sessionId]?.aktif) {
+          const user = accounts[sessionId];
+          currentUser = { uid: sessionId, email: user.email, nama: user.nama, role: user.role, aktif: true };
+          cekSesiLogin();
+          inisialisasiDataListeners();
+        } else {
+          sessionStorage.removeItem(SESSION_KEY);
+          cekSesiLogin();
+        }
+      } catch (error) {
+        console.error("Gagal memuat data lokal:", error);
+        tampilStatusLogin("Database lokal tidak dapat dibuka atau dimigrasikan: " + error.message, "error");
+      }
     }
-
-    cekSesiLogin();
-  }
-}
 
     /* =====================================================
-       FIRESTORE LISTENERS
+       LOCAL DATA LISTENERS
     ===================================================== */
 
-    function inisialisasiFirestoreListeners() {
-      hentikanFirestoreListeners();
+    function inisialisasiDataListeners() {
+      hentikanDataListeners();
 
-      unsubscribeProduk = db
+      unsubscribeProduk = localDb
         .collection("produk")
         .onSnapshot(
           (snapshot) => {
@@ -1224,7 +1561,7 @@
         );
 
 
-      unsubscribePenjualan = db
+      unsubscribePenjualan = localDb
         .collection("penjualan")
         .orderBy("Timestamp", "desc")
         .onSnapshot(
@@ -1239,17 +1576,13 @@
           (err) => {
             console.error("Error listener penjualan:", err);
 
-            /*
-              Jika query orderBy Timestamp belum dapat dijalankan
-              karena data lama memiliki Timestamp kosong, pesan ini
-              tetap dicatat di console agar mudah diperiksa.
-            */
+            console.error("Data laporan lokal tidak dapat dimuat:", err);
           }
         );
 
 
       if (userIsAdmin()) {
-      unsubscribePengguna = db
+      unsubscribePengguna = localDb
         .collection("pengguna")
         .onSnapshot(
           (snapshot) => {
@@ -1268,7 +1601,7 @@
       }
 
       if (userIsAdmin()) {
-      unsubscribeRiwayatStok = db
+      unsubscribeRiwayatStok = localDb
         .collection("riwayat_stok")
         .orderBy("Timestamp", "desc")
         .limit(200)
@@ -1284,7 +1617,7 @@
             console.error("Error listener riwayat stok:", err);
             const tbody = document.getElementById("tabelRiwayatStok");
             if (tbody) {
-              tbody.innerHTML = `<tr><td colspan="8" class="empty-state">Riwayat stok belum dapat dibaca. Periksa Firestore Rules untuk koleksi riwayat_stok.</td></tr>`;
+              tbody.innerHTML = `<tr><td colspan="8" class="empty-state">Riwayat stok lokal tidak dapat dibaca.</td></tr>`;
             }
           }
         );
@@ -1292,7 +1625,7 @@
     }
 
 
-    function hentikanFirestoreListeners() {
+    function hentikanDataListeners() {
       if (unsubscribeProduk) {
         unsubscribeProduk();
         unsubscribeProduk = null;
@@ -1783,20 +2116,14 @@
 
 
       try {
-        await db.runTransaction(async (transaction) => {
-
-          /*
-            Firestore transaction:
-            SEMUA READ dilakukan terlebih dahulu,
-            baru kemudian WRITE.
-          */
+        await localDb.runTransaction(async (transaction) => {
 
           const productDocs = [];
 
 
           for (const item of snapshotCart) {
             const ref =
-              db.collection("produk").doc(item.id);
+              localDb.collection("produk").doc(item.id);
 
             const doc =
               await transaction.get(ref);
@@ -1834,7 +2161,7 @@
 
 
           const notaRef =
-            db.collection("penjualan").doc();
+            localDb.collection("penjualan").doc();
 
 
           const itemsSnapshot =
@@ -1872,7 +2199,7 @@
               kembalian,
 
             Timestamp:
-              firebase.firestore.FieldValue.serverTimestamp()
+              new Date().toISOString()
           });
 
 
@@ -1881,9 +2208,7 @@
               data.ref,
               {
                 Stok:
-                  firebase.firestore.FieldValue.increment(
-                    -data.item.qty
-                  )
+                  (Number(data.doc.data().Stok) || 0) - data.item.qty
               }
             );
           }
@@ -2156,7 +2481,7 @@
 
 
       try {
-        await db.collection("produk").add({
+        await localDb.collection("produk").add({
           Kode: kode,
           "Nama Barang": nama,
           "Harga Beli": hargaBeli,
@@ -2207,7 +2532,7 @@
 
 
       try {
-        await db
+        await localDb
           .collection("produk")
           .doc(id)
           .delete();
@@ -2247,6 +2572,7 @@
 
 
       try {
+        if (!pastikanXlsxTersedia()) return;
         const data =
           await file.arrayBuffer();
 
@@ -2285,7 +2611,7 @@
             jsonResult.slice(i, i + chunkSize);
 
           const batch =
-            db.batch();
+            localDb.batch();
 
 
           chunk.forEach(row => {
@@ -2345,7 +2671,7 @@
 
 
             const docRef =
-              db.collection("produk").doc();
+              localDb.collection("produk").doc();
 
 
             batch.set(docRef, {
@@ -2397,6 +2723,7 @@
         return;
       }
 
+      if (!pastikanXlsxTersedia()) return;
 
       if (produkList.length === 0) {
         alert(
@@ -2505,7 +2832,7 @@
     }
 
     async function catatPergerakanStok(transaction, data) {
-      const ref = db.collection("riwayat_stok").doc();
+      const ref = localDb.collection("riwayat_stok").doc();
       transaction.set(ref, {
         jenis: data.jenis,
         produkId: data.produkId,
@@ -2521,7 +2848,7 @@
         keterangan: data.keterangan || "",
         petugas: currentUser.nama || currentUser.email || "Admin",
         petugasUID: currentUser.uid,
-        Timestamp: firebase.firestore.FieldValue.serverTimestamp()
+        Timestamp: new Date().toISOString()
       });
       return ref;
     }
@@ -2547,8 +2874,8 @@
       if (qty <= 0) return alert("Jumlah stok masuk harus lebih dari 0.");
 
       try {
-        await db.runTransaction(async transaction => {
-          const ref = db.collection("produk").doc(produk.id);
+        await localDb.runTransaction(async transaction => {
+          const ref = localDb.collection("produk").doc(produk.id);
           const snap = await transaction.get(ref);
           if (!snap.exists) throw new Error("Barang tidak ditemukan di database.");
 
@@ -2558,7 +2885,7 @@
 
           const update = {
             Stok: sesudah,
-            updatedAt: firebase.firestore.FieldValue.serverTimestamp()
+            updatedAt: new Date().toISOString()
           };
           if (hargaBeli > 0) update["Harga Beli"] = hargaBeli;
           transaction.update(ref, update);
@@ -2599,8 +2926,8 @@
       if (qty <= 0) return alert("Jumlah stok keluar harus lebih dari 0.");
 
       try {
-        await db.runTransaction(async transaction => {
-          const ref = db.collection("produk").doc(produk.id);
+        await localDb.runTransaction(async transaction => {
+          const ref = localDb.collection("produk").doc(produk.id);
           const snap = await transaction.get(ref);
           if (!snap.exists) throw new Error("Barang tidak ditemukan di database.");
 
@@ -2612,7 +2939,7 @@
           const sesudah = sebelum - qty;
           transaction.update(ref, {
             Stok: sesudah,
-            updatedAt: firebase.firestore.FieldValue.serverTimestamp()
+            updatedAt: new Date().toISOString()
           });
 
           await catatPergerakanStok(transaction, {
@@ -2651,8 +2978,8 @@
       if (!alasan) return alert("Alasan penyesuaian wajib diisi.");
 
       try {
-        await db.runTransaction(async transaction => {
-          const ref = db.collection("produk").doc(produk.id);
+        await localDb.runTransaction(async transaction => {
+          const ref = localDb.collection("produk").doc(produk.id);
           const snap = await transaction.get(ref);
           if (!snap.exists) throw new Error("Barang tidak ditemukan di database.");
 
@@ -2662,7 +2989,7 @@
 
           transaction.update(ref, {
             Stok: stokAktual,
-            updatedAt: firebase.firestore.FieldValue.serverTimestamp()
+            updatedAt: new Date().toISOString()
           });
 
           await catatPergerakanStok(transaction, {
@@ -2714,6 +3041,7 @@
 
     function exportRiwayatStok() {
       if (!ensureAdminForInventory()) return;
+      if (!pastikanXlsxTersedia()) return;
       if (riwayatStok.length === 0) {
         alert("Belum ada riwayat stok untuk diexport.");
         return;
@@ -2759,7 +3087,10 @@
           return timestamp.toLocaleString("id-ID");
         }
 
-        return String(timestamp);
+        const parsed = new Date(timestamp);
+        return Number.isNaN(parsed.getTime())
+          ? String(timestamp)
+          : parsed.toLocaleString("id-ID");
 
       } catch {
         return "-";
@@ -2844,6 +3175,7 @@
         return;
       }
 
+      if (!pastikanXlsxTersedia()) return;
 
       if (laporanPenjualan.length === 0) {
         alert(
@@ -3020,63 +3352,29 @@
           .value;
 
 
-      if (password.length < 6) {
+      if (password.length < 8) {
         alert(
-          "Password minimal 6 karakter."
+          "Password minimal 8 karakter."
         );
         return;
       }
 
 
-      let secondaryApp = null;
-
-
       try {
-        /*
-          Secondary Firebase App digunakan agar
-          createUserWithEmailAndPassword tidak
-          mengganti sesi Admin utama.
-        */
-
-        secondaryApp =
-          firebase.apps.find(
-            app => app.name === "SecondaryApp"
-          );
-
-
-        if (!secondaryApp) {
-          secondaryApp =
-            firebase.initializeApp(
-              firebaseConfig,
-              "SecondaryApp"
-            );
+        const existingAccounts = (await localDb.collection("pengguna").get()).docs
+          .map(doc => doc.data());
+        if (existingAccounts.some(user => normalisasi(user.email) === normalisasi(email))) {
+          throw new Error("Email tersebut sudah terdaftar.");
         }
-
-
-        const secondaryAuth =
-          secondaryApp.auth();
-
-
-        const res =
-          await secondaryAuth
-            .createUserWithEmailAndPassword(
-              email,
-              password
-            );
-
-
-        await db
+        const account = await buatAkun({
+          nama,
+          email: normalisasi(email),
+          role,
+          aktif: true
+        }, password);
+        await localDb
           .collection("pengguna")
-          .doc(res.user.uid)
-          .set({
-            nama: nama,
-            email: email,
-            role: role
-          });
-
-
-        await secondaryAuth.signOut();
-
+          .add(account);
 
         alert(
           "✅ Karyawan baru berhasil ditambahkan."
@@ -3091,23 +3389,10 @@
       } catch (err) {
         console.error(err);
 
-        /*
-          Jika akun Auth berhasil dibuat tetapi
-          penulisan profil Firestore gagal, akun Auth
-          tetap ada. Ini perlu diperiksa melalui Firebase
-          Console sebelum mencoba email yang sama lagi.
-        */
-
         alert(
           "❌ Gagal mendaftarkan karyawan:\n" +
           err.message
         );
-
-        try {
-          if (secondaryApp) {
-            await secondaryApp.auth().signOut();
-          }
-        } catch (_) {}
       }
     }
 
@@ -3139,29 +3424,20 @@
 
 
       if (!confirm(
-        `Hapus akses Firestore untuk "${nama}"?`
+        `Hapus akun lokal "${nama}"?`
       )) {
         return;
       }
 
 
       try {
-        /*
-          Tahap saat ini menghapus profil/akses
-          dari koleksi Firestore "pengguna".
-
-          Penghapusan akun Firebase Authentication
-          membutuhkan Admin SDK / Cloud Function.
-        */
-
-        await db
+        await localDb
           .collection("pengguna")
           .doc(id)
           .delete();
 
-
         alert(
-          "✅ Akses pengguna telah dihapus dari Firestore."
+          "✅ Akun lokal berhasil dihapus."
         );
 
       } catch (err) {
@@ -3257,7 +3533,9 @@
         if (html5QrCode) {
           await html5QrCode.clear();
         }
-      } catch (_) {}
+      } catch (err) {
+        console.warn("Gagal membersihkan scanner:", err);
+      }
 
 
       html5QrCode = null;
@@ -3286,6 +3564,13 @@
         tutupKameraScanner();
       }
     });
+
+    muatSesiLokal();
+
+    if ("serviceWorker" in navigator) {
+      navigator.serviceWorker.register("./service-worker.js")
+        .catch(error => console.error("Service worker offline tidak dapat dijalankan:", error));
+    }
   </script>
 
 </body>
